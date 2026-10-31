@@ -30,7 +30,10 @@ def main():
     
     dist_util.setup_dist()
     logger.configure()
-    
+
+    logger.log("training arguments:")
+    for name, value in sorted(vars(args).items()):
+        logger.log(f"  {name}: {value!r}")
 
     logger.log("creating model and diffusion...")
     model, diffusion = create_model_and_diffusion(
