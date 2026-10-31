@@ -75,6 +75,7 @@ def main():
         fp16_scale_growth=args.fp16_scale_growth,
         schedule_sampler=schedule_sampler,
         weight_decay=args.weight_decay,
+        train_steps=args.train_steps,
         lr_anneal_steps=args.lr_anneal_steps,
         loss_type=args.loss_type,
     ).run_loop()
@@ -87,13 +88,14 @@ def create_argparser():
         schedule_sampler="uniform",
         lr=1e-4,
         weight_decay=0.0,
+        train_steps=0,
         lr_anneal_steps=0,
         batch_size=1,
         microbatch=-1,  # -1 disables microbatches
         ema_rate="0.9999",  # comma-separated list of EMA values
         log_interval=10,
         save_interval=50000,
-        resume_checkpoint="",
+        resume_checkpoint="auto",
         use_fp16=False,
         fp16_scale_growth=1e-3,
         deterministic=True,

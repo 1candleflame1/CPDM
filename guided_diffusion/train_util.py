@@ -1,6 +1,8 @@
 import copy
 import functools
 import os
+import re
+import signal
 
 import blobfile as bf
 import torch as th
@@ -40,6 +42,7 @@ class TrainLoop:
         fp16_scale_growth=1e-3,
         schedule_sampler=None,
         weight_decay=0.0,
+        train_steps=0,
         lr_anneal_steps=0,
         loss_type,
     ):
@@ -58,12 +61,19 @@ class TrainLoop:
         )
         self.log_interval = log_interval
         self.save_interval = save_interval
-        self.resume_checkpoint = resume_checkpoint
+        if resume_checkpoint.lower() == "auto":
+            self.resume_checkpoint = find_resume_checkpoint()
+        elif resume_checkpoint.lower() in {"", "none"}:
+            self.resume_checkpoint = None
+        else:
+            self.resume_checkpoint = resume_checkpoint
         self.use_fp16 = use_fp16
         self.fp16_scale_growth = fp16_scale_growth
         self.schedule_sampler = schedule_sampler or UniformSampler(diffusion)
         self.weight_decay = weight_decay
+        self.train_steps = train_steps
         self.lr_anneal_steps = lr_anneal_steps
+        self.stop_requested = False
 
         self.step = 0
         self.resume_step = 0
@@ -81,7 +91,7 @@ class TrainLoop:
         self.opt = AdamW(
             self.mp_trainer.master_params, lr=self.lr, weight_decay=self.weight_decay
         )
-        if self.resume_step:
+        if self.resume_checkpoint:
             self._load_optimizer_state()
             # Model was resumed, either due to a restart or a checkpoint
             # being specified at the command line.
@@ -116,15 +126,15 @@ class TrainLoop:
 
 
     def _load_and_sync_parameters(self):
-        resume_checkpoint = find_resume_checkpoint() or self.resume_checkpoint
-
-        if resume_checkpoint:
-            self.resume_step = parse_resume_step_from_filename(resume_checkpoint)
+        if self.resume_checkpoint:
+            self.resume_step = parse_resume_step_from_filename(self.resume_checkpoint)
             if dist.get_rank() == 0:
-                logger.log(f"loading model from checkpoint: {resume_checkpoint}...")
+                logger.log(
+                    f"loading model from checkpoint: {self.resume_checkpoint}..."
+                )
                 self.model.load_state_dict(
                     dist_util.load_state_dict(
-                        resume_checkpoint, map_location=dist_util.dev()
+                        self.resume_checkpoint, map_location=dist_util.dev()
                     )
                 )
 
@@ -133,8 +143,9 @@ class TrainLoop:
     def _load_ema_parameters(self, rate):
         ema_params = copy.deepcopy(self.mp_trainer.master_params)
 
-        main_checkpoint = find_resume_checkpoint() or self.resume_checkpoint
-        ema_checkpoint = find_ema_checkpoint(main_checkpoint, self.resume_step, rate)
+        ema_checkpoint = find_ema_checkpoint(
+            self.resume_checkpoint, self.resume_step, rate
+        )
         if ema_checkpoint:
             if dist.get_rank() == 0:
                 logger.log(f"loading EMA from checkpoint: {ema_checkpoint}...")
@@ -147,9 +158,8 @@ class TrainLoop:
         return ema_params
 
     def _load_optimizer_state(self):
-        main_checkpoint = find_resume_checkpoint() or self.resume_checkpoint
         opt_checkpoint = bf.join(
-            bf.dirname(main_checkpoint), f"opt{self.resume_step:07}.pt"
+            bf.dirname(self.resume_checkpoint), f"opt{self.resume_step:07}.pt"
         )
         if bf.exists(opt_checkpoint):
             logger.log(f"loading optimizer state from checkpoint: {opt_checkpoint}")
@@ -159,9 +169,27 @@ class TrainLoop:
             self.opt.load_state_dict(state_dict)
 
     def run_loop(self):
+        previous_sigint_handler = signal.getsignal(signal.SIGINT)
+
+        def request_stop(signum, frame):
+            if self.stop_requested:
+                logger.log("second Ctrl+C received; exiting immediately.")
+                raise SystemExit(130)
+            self.stop_requested = True
+            logger.log("Ctrl+C received; finishing the current step before saving...")
+
+        signal.signal(signal.SIGINT, request_stop)
+        try:
+            self._run_loop()
+        finally:
+            signal.signal(signal.SIGINT, previous_sigint_handler)
+            self.writer.flush()
+            self.writer.close()
+
+    def _run_loop(self):
         while (
-            not self.lr_anneal_steps
-            or self.step + self.resume_step < self.lr_anneal_steps
+            not self.train_steps
+            or self.step + self.resume_step < self.train_steps
         ):
             batch, cond = next(self.data)
             batch_gt, cond_gt = next(self.data_gt)
@@ -174,9 +202,18 @@ class TrainLoop:
                 if os.environ.get("DIFFUSION_TRAINING_TEST", "") and self.step > 0:
                     return
             self.step += 1
+            if self.stop_requested:
+                logger.log(
+                    f"saving interruption checkpoint at "
+                    f"step {self.step + self.resume_step}..."
+                )
+                self.save()
+                logger.log("checkpoint saved; run train.sh again to resume training.")
+                return
         # Save the last checkpoint if it wasn't already saved.
         if (self.step - 1) % self.save_interval != 0:
             self.save()
+        logger.log(f"training complete at step {self.step + self.resume_step}.")
 
     def run_step(self, batch, cond, batch_gt):
         self.forward_backward(batch, cond, batch_gt)
@@ -303,9 +340,19 @@ def get_blob_logdir():
 
 
 def find_resume_checkpoint():
-    # On your infrastructure, you may want to override this to automatically
-    # discover the latest checkpoint on your blob storage, etc.
-    return None
+    logdir = get_blob_logdir()
+    if not logdir or not bf.exists(logdir):
+        return None
+
+    checkpoints = []
+    for filename in bf.listdir(logdir):
+        match = re.fullmatch(r"model(\d+)\.pt", filename)
+        if match:
+            checkpoints.append((int(match.group(1)), bf.join(logdir, filename)))
+
+    if not checkpoints:
+        return None
+    return max(checkpoints, key=lambda item: item[0])[1]
 
 
 def find_ema_checkpoint(main_checkpoint, step, rate):
